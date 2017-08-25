@@ -1,0 +1,1140 @@
+|=-----------------------------------------------------------------------=|
+|=----------------=[ Abusing Token Privileges For LPE]=------------------=|
+|=-----------------------------------------------------------------------=|
+|=----------------------=[ drone <@dronesec> ]=--------------------------=|
+|=------------------------=[ breenmachine ]=-----------------------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Table of contents
+
+0 - Introduction 
+1 - Token Overview 
+  1.1 - Windows Privilege Model 
+  1.2 - Token Structure and Privileges 
+  1.3 - Token Impersonation 
+2 - Modern Mitigations and Techniques 
+  2.1 - Modern Windows Kernel Mitigations
+  2.2 - Relevant Exploitation Strategies 
+3 - Abusing Token Privileges
+  3.1 - Exploitable Privileges 
+  3.2 - Exploiting Partial Writes
+  3.3 - Abusing Existing Service Accounts 
+4 - Case Studies 
+  4.1 - MS16-135 
+  4.2 - MS15-061
+  4.3 - HEVD 
+5 - Conclusions 
+6 - Greets 
+7 - References
+
+
+--[ 0 - Introduction
+ 
+Windows kernel exploitation has grown increasingly complex over the last
+several years, particularly with the release of Windows 10 and its
+successive core updates.  Techniques have been born and died over the
+course of months, new ones quickly replacing them.  Techniques themselves
+have grown hyper specific or brittle, fitting only a particular pattern or
+space.    
+ 
+Exploitation has often relied on obtaining some form of arbitrary code
+execution.  Obtaining a read/write primitive, stacking strategies to evade
+mitigations, and eventually obtaining the execution of a privileged action.
+Recently we've seen a trend towards logic basic actions, such as token
+stealing, enabling god mode bits, or NULLing out token security descriptors
+[0].  These actions delegate the theft of privileges to userland, freeing 
+the exploit dev from the confines of kernel hell.
+ 
+The token stealing shellcode popularized by many exploit developers and
+malware authors over the years is not one of chance.  It's been an
+extremely reliable technique offering stable, simple shellcode and, until
+recently, acceptable behavior.  Microsoft has implemented detection
+heuristics within its Advanced Threat Protection platform [2], but as of
+yet not implemented anything within the Windows kernel itself.  For malware
+writers and skiddies, this might be tolerable, but for advanced adversaries
+or red teamers, it is not.     
+ 
+This paper aims to discuss one such logic-based technique that we've
+refined over the last several months and exploits.  Although the techniques
+themselves are not new [2], we hope to present new approaches and ideas
+that may aid in the further refinement of this technique and others.
+ 
+In addition to kernel exploitation, token privileges can be abused in other
+less exotic ways. In situations where a service account is compromised,
+which has non-standard privileges enabled, they can often be leveraged to
+gain elevation of privilege (EoP). The methods for doing this are specific 
+to each privilege, often undocumented, and in many cases non-trivial. In 
+section 3.3 of this paper we demonstrate how many of these privileges can be
+abused for EoP in common penetration testing and red teaming scenarios.
+ 
+We aim to consolidate disparate sources and provide reference for future
+work.  We acknowledge the time and efforts of other researches within the
+same space, and hope to give something meaningful back to the community at
+large.
+ 
+--[ 1 - Token Overview
+ 
+The basis of our strategy again stems from the very core of the object
+access model within Windows.  Windows uses token objects to describe the
+security context of a particular thread or process.  These token objects,
+represented by the nt!_TOKEN structure, contain a vast swath of security
+and referential information, including integrity level, privileges, groups,
+and more.  Our focus lies on the privileges contained within these tokens.
+ 
+----[ 1.1 - Windows Privilege Model
+ 
+We'll briefly describe the Windows privilege model as it relates to process
+and thread tokens.  If you'd like an in-depth explanation, the authors
+recommend Windows Internals Part 1 or spending some time in windbg.
+ 
+Each process on the system holds a token object reference within its
+EPROCESS structure which is used during object access negotiations or
+privileged system tasks.  This token is granted via LSASS during the logon
+process, and thus all processes within a session run under the same token,
+initially.
+ 
+A process holds a primary token and threads executing within the process
+inherit this same token.  When a thread needs to access an object using a
+different set of credentials, it can use an impersonation token.  Using an
+impersonation token does not impact the primary token or other threads, but
+only execution in the context of the impersonating thread.  These
+impersonation tokens can be obtained via a number of different APIs
+provided by the kernel.
+ 
+The token serves as a processes access ticket, which must be presented to
+the various gatekeepers within Windows; it's evaluated via SeAccessCheck on
+object access and by SeSinglePrivilegeCheck during privileged operations.
+When a process requests write access to a file, for example, SeAccessCheck
+will evaluate the tokens integrity level followed by an evaluation of its
+Discretionary Access Control List (DACL).  When a process attempts to
+shutdown a system via NtShutdownSystem, the kernel will evaluate whether or
+not the requesting process token has SeShutdownPrivilege enabled.  
+ 
+----[ 1.2 - Token Structure and Privileges
+ 
+As mentioned, the _TOKEN structure primarily contains security context
+information about a process or thread.  The relevant entry for our purposes
+is _SEP_TOKEN_PRIVILEGES, located at offset 0x40, containing token
+privilege information:
+ 
+  kd> dt nt!_SEP_TOKEN_PRIVILEGES c5d39c30+40 
+    +0x000 Present          : 0x00000006`02880000 
+    +0x008 Enabled          : 0x800000
+    +0x010 EnabledByDefault : 0x800000
+ 
+The Present entry represents an unsigned long long containing the present
+privileges on the token.  This does not mean that they are enabled or
+disabled, but only that they exist on the token.  Once a token is created,
+you cannot add privileges to it; you may only enable or disable existing
+ones found in this field.  The second field, Enabled, represents an
+unsigned long long containing all enabled privileges on the token.
+Privileges must be enabled in this bitmask to pass the
+SeSinglePrivilegeCheck.  The final field, EnabledByDefault, represents the
+initial state of the token at the moment of conception.
+ 
+Privileges can be enabled or disabled by twiddling specific bits within
+these fields.  For example, to enable SeCreateTokenPrivilege, one would
+simply need to execute: _SEP_TOKEN_PRIVILEGES+0x44 |= 1 << 0x000000002.
+Disabling the privilege would be the inverse: _SEP_TOKEN_PRIVILEGES+0x44 &=
+~(1 << 0x000000002).  A Pykd helper script can be found here [3].
+ 
+Up until recently, one must only set bits within the Enabled field to
+actually toggle privileges within a token.  This means that a single write,
+partial or otherwise, is enough to enable privileges.  With the release of
+Windows 10 v1607, however, the kernel now verifies that the enabled bits
+are also flipped in the Present field [4].   
+ 
+Although on the surface the tokens security model of defining specific
+privileges for various tasks appears to allow for the implementation of
+service specific, fine-grained access controls, a closer look reveals a
+more complex situation. Many of the privileges, when enabled, allow the
+user to perform privileged actions that can result in elevation of
+privilege. This effectively destroys the "fine-grain" access control
+structure and can provide a false sense of security.
+ 
+----[ 1.3 - Token Impersonation
+ 
+Before diving into specific privileges, it will be beneficial to describe
+the Windows mechanism for determining whether a specific thread can make
+use of a given token. Any user may be able to obtain a handle to a
+privileged token, but being able to actually use it is another matter.
+ 
+In Windows, “Token Impersonation” is when a new token is assigned to a
+thread that is different from the parent process's token. Although the word
+impersonation implies that one user is using a token belonging to a
+different user, this is not always the case. A user may impersonate a token
+that belongs to them but simply has a different set of privileges or some
+other modifications.
+ 
+One of the fields specified in every token is the tokens impersonation
+level. This field controls whether that token can be used for impersonation
+purposes and to what degree. The four impersonation levels are as follows:
+ 
+  SecurityAnonymous - The server cannot impersonate or identify the client.
+  SecurityIdentification - The server can get the identity and privileges of
+                           the client, but cannot impersonate the client.  
+  SecurityImpersonation - The server can impersonate the client's security 
+                          context on the local system.
+  SecurityDelegation - The server can impersonate the client's security
+                       context on remote systems.
+ 
+SecurityImpersonation and SecurityDelegation are the most interesting cases
+for us. Identification tokens and lower can not be used to run code.
+ 
+Whether or not a given user is allowed to impersonate a specific token can
+be determined as follows:
+ 
+  IF the token level < Impersonate THEN allow (such tokens are called
+  “Identification” level and can not be used for privileged actions).  
+  IF the process has “Impersonate” privilege THEN allow.  
+  IF the process integrity level <= the token integrity level AND 
+  the process user == token user THEN allow ELSE restrict the 
+  token to “Identification” level (no privileged actions possible).
+ 
+--[ 2 - Modern Mitigations and Techniques
+ 
+Windows 10 significantly improves upon the security of the Windows kernel,
+both in overall reducing the attack surface and improving existing
+defenses.  Microsoft continues to iterate on defensive mechanisms: KASLR
+continues to receive much needed improvements (still many leaks), hardening
+of often exploited structures for read/write primitives (tagWND), and
+mitigating the revered NULL SecurityDescriptor technique [5].  As attackers
+have demonstrated over the years, squashing individual strategies only
+gives birth to newer ones, and the cycle continues.
+ 
+In order to provide some context on the topics discussed, a brief
+description of modern kernel mitigations and exploitation techniques
+follows.  These sections are by no means authoritative or comprehensive,
+and are meant only to reinforce the overall complexity and upfront
+investment cost of modern kernel exploitation.  Go ask Ionescu if you have
+questions.   
+ 
+----[ 2.1 - Modern Windows Kernel Mitigations
+ 
+Windows 10 and successive updates (Anniversary/Creators) have included a
+number of exploit mitigation improvements, detailed by Skape et al. at
+Blackhat 2016 [8].  We recommend reviewing the referenced slides for
+further details and statistics on general Windows mitigation strategies.
+We will focus on mitigations relevant to the topic at hand.
+ 
+Kernel ASLR has seen improvement by enabling ASLR on various regions and
+structures within the kernel.  Though this is a strong mitigation strategy
+for remote kernel exploits, there exists several public and private
+strategies for leaking object addresses in the kernel [9], and thus does
+not pose much of a threat for the technique detailed here.  Core data
+structures and memory regions once used for KASLR bypasses, such as the
+HAL dispatch table, are now fully randomized.
+ 
+The AppContainer, first introduced in Windows 8, provides sandboxing
+capabilities for userland applications.  This control has been expanded upon in
+Windows 10 to include win32k system call filtering which restricts the
+process from abusing various win32k syscalls.  This is currently only 
+(officially) enabled for the Edge browser, and thus is not very interesting.
+ 
+A common kernel read/write primitive is the tagWND structure, which when
+corrupted allows for arbitrary read/writes via
+InternalGetWindowText/NtUserDefSetText. Exploits for MS15-061 and more 
+recently MS16-135 were found to be taking advantage of this technique.  The 
+Anniversary Update now provides additional bounds checks on this specific 
+object, rendering it useless.  Though this form of technique squashing is 
+rudimentary, a mere annoyance in having to find other rw primitives, it 
+can be effective for breaking already deployed/developed chains.
+ 
+The introduction of SMEP in Windows 8 means we can no longer ask the kernel
+to execute userland shellcode for us.  Many bypasses have been used over
+the years, some still effective, most not.  Evasion generally involves
+disabling some principle of mitigation or getting code into the kernel (via
+RWX regions or KROP).  Because we're not looking to execute any shellcode
+within the kernel or even in userland, this mitigation does not apply.
+ 
+Another interesting mitigation is the mythical Patchguard, formerly known
+as Kernel Patch Protection, introduced many moons ago to the x64 NT kernel.
+If you're unfamiliar with this mitigation, know that it is the kernel
+boogeyman.  It monitors a random subset of checks, at random times, for
+random reasons.  Its initialization and runtime behavior are obfuscated.
+Its source code and behavior are obfuscated from even internal Windows
+developers.  Skywing and Skape have previously done quite a bit of work
+reversing and documenting portions of it, and should be referenced for
+further tales of intrigue [18]. 
+ 
+As of Windows 10, there are 44 different checks in Patchguard (visible via
+!analyze -show 109), and while the authors are suspicious of the lists
+completeness, there is no protection of process tokens.     
+
+----[ 2.2 - Relevant Exploitation Strategies
+ 
+Previous, related work that provided influence and indirect guidance for this
+article's strategy is presented here.  These related techniques are briefly
+detailed to provide background and to pay homage to those who came before
+us.
+ 
+Cesar Cerrudos Easy Local Windows Kernel Exploitation paper released at
+Blackhat 2012 [11] introduced three different privilege escalation
+strategies, and pointed many exploit devs towards the power of abusing
+process tokens.  The first technique demonstrated in the paper details the
+NULL ACL strategy, now partially mitigated, in which an arbitrary
+write could be leveraged to NULL a privileged object's ACL.  This was and is a
+very common strategy for effectively migrating into more privileged
+processes.
+ 
+The second Cerrudos strategy is a carpet bombing version of ours, in which an
+arbitrary write could enable all privileges in a process token.  With these
+privileges enabled, one could exploit SeDebugPrivilege and migrate into a
+more privileged process, create tokens with SeCreateTokenPrivilege, or load
+kernel drivers with SeLoadDriverPrivilege.
+ 
+The third and final Cerrudos strategy is another technique very popular in 
+modern EoP exploits, and involves replacing a process token with a SYSTEM 
+token. This has been widely detailed from various perspectives elsewhere, 
+and will not be repeated here.
+ 
+Yin Liang and Zhou Li of Tencent conducted and released similar research at
+Blackhat Europe 2016, in which they demonstrated abusing partial writes
+with window objects in order to obtain rw primitives [11].  Much like our
+work, they focused on partially controlled, limited write bugs such as
+MS16-135 and CVE-2016-0174 in which the target of an OR or DEC may be
+controlled.  In these cases, particularly those involving win32k, our
+strategy obviates the need to obtain a primitive.
+ 
+Moritz Jodeit published a great article on CVE-2014-4113, in which he
+targeted the _SEP_TOKEN_PRIVILEGES structure with an uncontrolled write in
+order to enable additional token privileges [12].  His technique is of
+interest because it demonstrated, at the time, modern mitigation evasion
+without any pointer overwrites or the execution of shellcode, with the
+added benefit of a vastly simplified exploitation process.  
+ 
+--[ 3 - Abusing Token Privileges
+
+----[ 3.1 - Exploitable Privileges
+ 
+For the purpose of this paper, we will define an “exploitable” privilege as
+any token privilege that can be used alone to gain “NT AUTHORITY\SYSTEM”
+level access to the target system. The term “exploit” is used loosely here,
+in most cases these exploits are intended, albeit undocumented, behavior.
+ 
+As was mentioned in section 1.2, the nt!_SEP_TOKEN_PRIVILEGES structure is
+a binary field in the token where each bit determines whether a given
+privilege is present or enabled in the token. The exact structure of this
+bitmask, which bits correspond to which privileges, can be found in the
+code released with this project, specifically the pykd script -
+“tokenum.py”.
+ 
+The remainder of this section deals with the details of each privilege we
+were able to successfully abuse to gain elevated privileges. Code samples
+to take advantage of each of these privileges are included with this
+project.
+ 
+------ [ 3.1.1 - SeImpersonatePrivilege
+ 
+The SeImpersonatePrivilege is described on MSDN as “User Right: Impersonate
+a client after authentication.” This is the privilege referred to in
+section 1.4, in the second step, when checking whether a specific process can
+impersonate a given token. Any process holding this privilege can
+impersonate any token for which it is able to get a handle. It should be
+noted that this privilege does not allow for the creation of new tokens.
+ 
+This particular privilege is quite interesting because it is required by a
+number of common Windows service accounts, such as LocalService and those
+for MSSQL and IIS. An “exploit” for this privilege then would also yield
+elevation of privilege if any such accounts were compromised. This was the
+subject of previous work by the authors [6].
+ 
+In [20], a method to gain a handle to a token for the “NT AUTHORITY\SYSTEM”
+account is described. Basically a Windows service (DCOM) is passed a
+specially crafted object that contains a reference to an attacker
+controlled TCP listener on the local machine. When Windows tries to resolve
+this reference, the attacker requests NTLM authentication and then relays
+the NTLM authentication sent to the listener to create a new token on the
+local machine. This token will be for the user “NT AUTHORITY\SYSTEM” and
+have full administrative privilege.
+ 
+Any user can perform the previously described procedure to gain a handle to
+a token for the “NT AUTHORITY\SYSTEM” user, however in order to make use of
+this handle, the ability to impersonate is required; the
+SeImpersonatePrivilege allows us to do just that. All that is required to
+spawn a new process with the elevated token is to call the
+CreateProcessWithToken function, passing the new token as the first
+argument.
+ 
+------ [ 3.1.2 - SeAssignPrimaryPrivilege
+ 
+The SeAssignPrimaryPrivilege is offensively very similar to the previously
+discussed SeImpersonatePrivilege. It is needed to “assign the primary token
+of a process”. Our strategy will be to spawn a new process using an
+elevated token.
+ 
+In order to create a new process with a privileged token, we will first
+need to get a handle to such a token. To do this, we follow the procedure
+described in [20] and briefly outlined in section 3.1.1.
+ 
+As the name of this privilege implies, it allows us to assign a primary
+token to a new or suspended process.  Using the strategy outlined in 3.1.1
+to obtain a token, we find ourselves with a privileged impersonation token,
+and thus will need to first derive a primary token from it.  This can be
+accomplished via the DuplicateTokenEx function:
+ 
+  DuplicateTokenEx(hClientToken, TOKEN_ALL_ACCESS, 
+                   NULL, SecurityAnonymous,
+                   TokenPrimary, &hDupedToken);
+ 
+With a privileged primary token in hand, we now have a few options.
+Unfortunately, we cannot simply swap the token of our currently running
+process for the elevated one, as changing primary tokens on running
+processes is not supported behavior.  This is controlled by the
+PrimaryTokenFrozen field in the EPROCESS structure.
+ 
+The simplest option is to make a call to “CreateProcessAsUser” using the
+new token as an argument to create a new, highly privileged process.
+ 
+Alternatively, we can spawn a new process in the suspended state and 
+perform the same operation as above. When a new processes is created 
+with a call to CreateProcess(..., CREATE_SUSPENDED, ...), the value for
+PrimaryTokenFrozen is not yet set, allowing the token to be swapped.
+ 
+A corollary to the previous point is that in some partial write
+exploitation scenarios, we can actually swap the token of the currently
+running process for an elevated one. If we can cause the PrimaryTokenFrozen
+field to be unset through our partial write, assuming we possess, or can
+gain SeAssignPrimaryTokenPrivilege, we can then call
+NtSetInformationProcess to swap the old token for the new one. Since
+PrimaryTokenFrozen is a single bit field, the surrounding fields are
+relevant because they will likely be trashed by any sort of partial write:
+ 
+  +0x0c8 RefTraceEnabled  : Pos 9, 1 Bit 
+  +0x0c8 DisableDynamicCode : Pos 10, 1 Bit
+  +0x0c8 EmptyJobEvaluated : Pos 11, 1 Bit
+  +0x0c8 DefaultPagePriority : Pos 12, 3 Bits
+  +0x0c8 PrimaryTokenFrozen : Pos 15, 1 Bit
+  +0x0c8 ProcessVerifierTarget : Pos 16, 1 Bit
+  +0x0c8 StackRandomizationDisabled : Pos 17, 1 Bit
+ 
+If for example you've got an arbitrary decrement, as in MS15-061, you can
+unset the TokenPrimaryFrozen bit and swap your process token out:
+ 
+  NtSetInformationProcess(hCurrentProcess, 
+                          (PROCESS_INFORMATION_CLASS)0x09,
+                          &hElevatedPrimaryToken, 8);
+ 
+------ [ 3.1.3 - SeTcbPrivilege
+ 
+SeTcbPrivilege is quite interesting, MSDN describes it as “This privilege
+identifies its holder as part of the trusted computer base. Some trusted
+protected subsystems are granted this privilege.” In addition to this, a
+number of books, articles, and forum posts describe the TCB privilege as
+being equivalent to fully privileged access to the machine. However,
+despite all this, no publicly available resources seem to indicate HOW the
+SeTcbPrivilege can be used, on its own, to perform privileged operations.
+ 
+We began by analyzing MSDN documentation, trying to find which Windows API
+calls were restricted to accounts with SeTcbPrivilge. In the documentation
+for the LsaLogonUser function, we find the following as the first
+parameter:
+ 
+LsaHandle [in] A handle obtained from a previous call to
+LsaRegisterLogonProcess.  The caller is required to have SeTcbPrivilege
+only if one or more of the following is true:
+ 
+  + A Subauthentication package is used.
+  + KERB_S4U_LOGON is used, and the caller requests an impersonation token.
+  + The LocalGroups parameter is not NULL.
+ 
+  If SeTcbPrivilege is not required, call LsaConnectUntrusted to obtain
+  the handle.
+ 
+Normally the LsaLogonUser API call is used to authenticate a user with some
+form of credentials, however we are assuming that we have no knowledge of
+the target system and its users. Further, which user will we attempt to
+logon? Finally, how will we impersonate the resulting token since we do not
+have SeImpersonatePrivilege? 
+ 
+Thankfully James Forshaw chimed in with a very useful <140 character
+message:
+ 
+  “you could use LsaLogonUser to add admin group to a token of your own user,
+  then impersonate.” 
+ 
+There is an interesting logon type in Windows known as S4U logon (and
+referenced above as KERB_S4U_LOGON). It is effectively described in an MSDN
+blog post [19] as follows:
+ 
+  “In Windows, it is possible to logon as a different domain user without any
+  credentials.  This is known as a S4U or a Service For User Logon.  This is
+  a Microsoft Extension to Kerberos introduced with Windows Server 2003.”
+ 
+This seems to fit what we are trying to do perfectly; using the S4U logon
+type, we can obtain a token for any user. Referring back to the
+documentation for the LsaHandle parameter above, if we have SeTcbPrivilege,
+apparently the resulting token can be an “impersonation” token, meaning we
+can assign it to a thread.
+ 
+Referring again to the LsaHandle parameter, the last bullet point implies
+that we can call LsaLogonUser with SeTcbPrivilege and add arbitrary groups
+to the resulting token returned by this call. We will add the group SID
+“S-1-5-18” to the token, this is the SID for the Local System account and
+if we are using a token that possesses it, we will have full privilege on
+the system.  Adding the SYSTEM SID is quite straightforward:
+ 
+  WCHAR systemSID[] = L"S-1-5-18"; 
+  ConvertStringSidToSid(systemSID, &pExtraSid);
+
+  pGroups->Groups[pGroups->GroupCount].Attributes = 
+                    SE_GROUP_ENABLED | SE_GROUP_MANDATORY; 
+  pGroups->Groups[pGroups->GroupCount].Sid = pExtraSid;
+  pGroups->GroupCount++;
+ 
+The only piece remaining in this puzzle is how we will use the resulting
+impersonation token, since we are assuming that we have SeTcbPrivilege, but
+no other impersonation related privileges. Referring back to section 1.4 on
+the rules related to token impersonation, we can see that we should be able
+to impersonate the token without any special privileges as long as the
+token is for our current user and the integrity level of the token is
+“Medium”. So using the token returned by LsaLogonUser, we simply set the
+integrity level to “Medium” and then call SetThreadToken to replace our
+current thread's token with the new one.  
+ 
+------ [ 3.1.4 - SeBackupPrivilege
+ 
+The SeBackupPrivilege is described on MSDN as follows:
+ 
+  “Required to perform backup operations. This privilege causes the system to
+  grant all read access control to any file, regardless of the access control
+  list (ACL) specified for the file. Any access request other than read is
+  still evaluated with the ACL. This privilege is required by the RegSaveKey
+  and RegSaveKeyExfunctions. The following access rights are granted if this
+  privilege is held: -READ_CONTROL -ACCESS_SYSTEM_SECURITY -FILE_GENERIC_READ
+  -FILE_TRAVERSE”
+ 
+To use this privilege for EoP, we read the password hashes of local
+Administrator accounts from the registry and then pass these to a local
+service from which we can get code execution, the most popular technique
+here would simply be passing the hash with “psexec” or “wmiexec”. 
+ 
+Unfortunately for us there are two caveats in this scenario.  First, many
+organizations over the past several years have begun to disable local
+administrator accounts. Second, even in cases where some local
+administrator accounts remain enabled, Microsoft implemented a change in
+Windows Vista and newer where only the RID 500 (the default local
+Administrator) account can administer the machine remotely by default:
+ 
+  When a user who is a member of the local administrators group on the
+  target remote computer establishes a remote administrative
+  connection…they will not connect as a full administrator. The user has
+  no elevation potential on the remote computer, and the user cannot
+  perform administrative tasks.
+ 
+In our experience however, it is still fairly common in enterprise
+environments to find the RID 500 local administrator account enabled.
+ 
+------ [ 3.1.5 - SeRestorePrivilege
+ 
+The restore privilege is described as being “required to perform restore
+operations”, and causes the system to grant all write access control to any
+file on the system, regardless of the files ACL.  Additionally, this
+privilege allows the holding process or thread to change the owner of a
+file.  The implications of obtaining this privilege should be obvious.
+ 
+In order to use this privilege, one must supply the
+FILE_FLAG_BACKUP_SEMANTICS flag to supporting APIs.  This tips the kernel
+off that the requesting process might have SeBackupPrivilege or
+SeRestorePrivilege enabled, and to check for it before short circuiting the
+DACL check.  Keen observers may infer from the terse description of the
+privilege on MSDN that this also allows for the creation or modification of
+registry keys.
+ 
+Arbitrary writes to HKLM opens up infinite potential for privilege
+escalation.  We chose to use the Image File Execution Options key, used for
+debugging software on a system.  When a system binary is launched, if an
+HKLM entry exists for it at HKLM\SOFTWARE\Microsoft\Windows
+NT\CurrentVersion\Image File Execution Options and it contains a Debugger
+key, it will execute the set entry.  This technique is fairly common for
+malware persistence and privilege escalation vulnerabilities [7].
+Exploitation simply requires opening the registry, specifying the backup
+flag, and creating the key:
+ 
+  RegCreateKeyExA(
+    HKEY_LOCAL_MACHINE, 
+    “HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File 
+                                    Execution Options\wsqmcons.exe”, 
+    0, NULL,
+    REG_OPTION_BACKUP_RESTORE, 
+    KEY_SET_VALUE, 
+    NULL, 
+    &hkReg, 
+    NULL);
+ 
+  RegSetValueExA(hkReg, 
+    "Debugger", 0, REG_SZ, 
+    (const BYTE*)regentry,
+    strlen(regentry) + 1);
+ 
+In the above sample we used wsqmcons, a consolidator service that runs as
+SYSTEM and is triggerable by a standard user on the system.  
+ 
+In addition to adding registry entries, one could also drop DLLs into
+system folders for DLL hijacking, overwrite critical system resources, or
+modify other services.      
+ 
+------ [ 3.1.6 - SeCreateTokenPrivilege
+ 
+The “SeCreateTokenPrivilege” allows users to create primary tokens via the
+ZwCreateToken API. Unfortunately, this right alone does not allow the user
+to use the token they have just created. Therefore naive attempts to create
+and use tokens for high privileged users such as “NT AUTHORITY\SYSTEM” will
+not succeed.
+ 
+Recall the rules for token impersonation from section 1.4. A user is
+allowed to impersonate a token even without SeImpersonatePrivilege so long
+as the token is for the same user and the integrity level is less than or
+equal to the current process integrity level.
+ 
+In order to leverage SeCreateTokenPrivilege, we need only craft a new
+impersonation token that matches the requesting token with the addition of
+a privileged group SID.  This is in theory pretty simple to do, but the API
+for these interfaces and ZwCreateToken is not very friendly.  Most of the
+fields we can query from our executing token via GetTokenInformation, with
+only a few exceptions.
+ 
+As mentioned, we want to enable the local administrator group on the token.
+To do this, we build a SID using the RID of the group:
+ 
+  SID_BUILTIN SIDLocalAdminGroup = { 1, 2, { 0, 0, 0, 0, 0, 5 }, { 32,
+                                    DOMAIN_ALIAS_RID_ADMINS } };
+ 
+We then iterate over the token's groups and elevate it from user to
+administrative membership:
+ 
+  for (int i = 0; i < groups->GroupCount; ++i, pSid++) { 
+    PISID piSid = PISID)pSid->Sid; 
+    if (piSid->SubAuthority[piSid->SubAuthorityCount - 1] == 
+            DOMAIN_ALIAS_RID_USERS){ 
+      memcpy(piSid, &TkSidLocalAdminGroup, sizeof(TkSidLocalAdminGroup));
+      pSid->Attributes = SE_GROUP_ENABLED; 
+    } 
+  }
+ 
+The final change is ensuring that we're building a TokenImpersonation
+token.  This can be set in the token's object attributes:
+ 
+  SECURITY_QUALITY_OF_SERVICE sqos = { sizeof(sqos), 
+                                       SecurityImpersonation,
+                                       SECURITY_STATIC_TRACKING, FALSE }; 
+  OBJECT_ATTRIBUTES oa = { sizeof(oa), 0, 0, 0, 0, &sqos };
+ 
+Provided we maintain the token user and integrity level, we can finally use
+the token and impersonate the executing thread.  
+ 
+------ [ 3.1.7 - SeLoadDriverPrivilege
+ 
+The LoadDriver privilege is described by Microsoft as “User Right: Load and
+unload device drivers”. The fact that device drivers run in the kernel
+makes this a very desirable privilege.
+ 
+Our goal then is to execute arbitrary code in the kernel given only
+SeLoadDriverPrivilege and to bypass any driver signing requirements in the
+process; a tall order. Most documentation on this privilege and the
+associated “NtLoadDriver” Windows API call assumes that the caller has
+additional privilege on the system, specifically the ability to write to
+the HKLM (HKEY_LOCAL_MACHINE) section of the Windows registry.
+ 
+The format of the Windows API call to load a driver is as follows:
+ 
+  NTSTATUS NtLoadDriver( _In_ PUNICODE_STRING DriverServiceName);
+ 
+  DriverServiceName [in] Pointer to a counted Unicode string that specifies a
+  path to the driver's registry key,
+  \Registry\Machine\System\CurrentControlSet\Services\DriverName, where
+  DriverName is the name of the driver.
+ 
+The DriverServiceName parameter is a pointer to a registry location. Under
+the “DriverName” key, there should be at least the following two values:
+ 
+  + ImagePath - A string in the format “\??\C:\path\to\driver.sys” 
+  + Type - A DWORD that should be set to “1”
+ 
+Notice the “DriverServiceName” parameter format supposedly (according to
+the documentation) must begin with “\Registry\Machine” which is a reference
+to the HKLM registry key for which we are assuming we do not have access.
+In order to circumvent this obstacle, we can actually use a path that
+points to HKCU (HKEY_CURRENT_USER) instead such as
+“\Registry\User\S-1-5-21-582075628-3447520101-2530640108-1003\”. Here the
+numeric ID in the string is the RID for our current user.  We must do this
+because the kernel doesn't know what HKCU is, as it's purely a userland
+helper that points into the HKLM hive.
+ 
+Since “System\CurrentControlSet\Services\DriverName” does not exist under
+this path we must create it, which we can do since it is the current user's
+registry hive.  The format for loading a simple driver is fairly
+straightforward.  We must, at minimum, define two things:
+ 
+  + REG_DWORD Type 
+  + REG_SZ ImagePath
+ 
+The type defines the service, as listed in wdm.h:
+ 
+  #define SERVICE_KERNEL_DRIVER          0x00000001 
+  #define SERVICE_FILE_SYSTEM_DRIVER     0x00000002 
+  #define SERVICE_ADAPTER                0x00000004 
+  #define SERVICE_RECOGNIZER_DRIVER      0x00000008 
+  [....]
+ 
+In our case, we'll use the SERVICE_KERNEL_DRIVER type.  Once these values
+are set, we can then invoke NtLoadDriver with a path to our registry key
+and load the driver into the kernel.
+ 
+There are several other strategies that can be used to load kernel mode
+drivers, such as the FltMgr or condrv key, but these cannot be used without
+administrative privileges in the first place.
+ 
+------ [ 3.1.8 - SeTakeOwnershipPrivilege
+ 
+This privilege is, offensively, similar to SeRestorePrivilege.  According
+to MSDN, it allows a process to “take ownership of an object without being
+granted discretionary access” by granting the WRITE_OWNER access right.
+Exploiting this privilege is very similar to SeRestorePrivilege, except we
+first need to take ownership of the registry key we want to write to.
+ 
+Taking ownership of the registry key requires building an ACL with updated
+ownership, then modifying the DACL so that we can write into it.  Building
+an ACL requires the construction of an EXPLICIT_ACCESS object:
+ 
+  ea[0].grfAccessPermissions = KEY_ALL_ACCESS;
+  ea[0].grfAccessMode = SET_ACCESS; 
+  ea[0].grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+  ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID; 
+  ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER; 
+  ea[0].Trustee.ptstrName = (LPTSTR)user->User.Sid; // owner 
+ 
+We can then use SetEntriesInAcl to build the ACL object.  Once the ACL
+object is composed, we take ownership of the registry path:
+ 
+  SetNamedSecurityInfo(
+        _TEXT("MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion
+                \\Image File Execution Options"), 
+        SE_REGISTRY_KEY,
+        OWNER_SECURITY_INFORMATION, 
+        user->User.Sid, 
+        NULL, NULL, NULL);
+ 
+Once we own the registry key, we make one last call to SetNamedSecurityInfo
+to enable the previously composed ACL and gain write privileges to the
+entry:
+ 
+    SetNamedSecurityInfo(_TEXT("MACHINE\\SOFTWARE\\Microsoft\\Windows
+                            NT\\CurrentVersion\\Image File Execution Options"), 
+                        SE_REGISTRY_KEY, // type of object 
+                        DACL_SECURITY_INFORMATION,   // change DACL 
+                        NULL, NULL, // do not change owner or group 
+                        pACL, // DACL specified 
+                        NULL);
+ 
+At this point we can follow the same steps taken via the SeRestorePrivilege
+method, making sure to restore registry ownership once we're done.
+ 
+Much like SeRestorePrivilege, we can also take control of critical system
+files or folders to abuse DLL load order or other such techniques.  
+ 
+------ [ 3.1.9 - SeDebugPrivilege
+ 
+SeDebugPrivilege is very powerful, it allows the holder to debug another
+process, this includes reading and writing to that process' memory. This
+privilege has been widely abused for years by malware authors and exploit
+developers, and therefore many of the techniques that one would use to gain
+EoP through this privilege will be flagged by modern endpoint protection
+solutions.
+ 
+There are a host of various memory injection strategies that can be used
+with this privilege that evade a majority of AV/HIPS solutions.  Finding
+these is left as an exercise for the reader.
+ 
+----[ 3.2 - Exploiting Partial Writes
+ 
+With an understanding of how individual privileges can be exploited, we can
+now begin to demonstrate how and why these might be useful to us.  Case
+studies will be discussed further in section 4.
+ 
+This technique was born from attempts at evading various kernel and
+userland mitigations via partial write exploits.  To establish a familiar
+vernacular, a partial write is an instruction in which the destination is
+controlled, but the value written may not be.  Or the value may be a single
+bit or byte modification, such as a decrement or addition.  Take for
+example a DEC operation; if the destination address can be controlled, then
+we've got the ability to arbitrarily decrement any address by one.  The OR
+instruction is another example; while we may control the destination in
+which we perform the OR operation, we might not control the value in which
+we OR it with: OR DWORD PTR[controlled], 4.
+ 
+Commonly, exploiting these would require modifying object fields, such as a
+length, in order to obtain an arbitrary or partial read/write primitive.
+Others may make modifications to page tables or mangle other kernel mode
+data structures.  These are all pieces to a larger exploit chain that
+generally ends in NULLing an ACL, swapping process tokens, or executing a
+privileged usermode process.  Privileged execution (see:payload) changes
+with the mitigation landscape.
+ 
+Instead of trying to execute ROP in the kernel or mangle kernel objects,
+why not delegate the escalation of privileges to userland?  Much like the
+process swapping strategy, if we can enable elevated privileges in
+userland, we stand to benefit from increased reliability, trivial
+sidestepping of various kernel mitigations, and increased flexibility in
+the deliverance of some malicious payload.  We want to persist on a system
+unimpeded, and to do so we must remain clandestine.  
+ 
+As discussed in section 1.2, each token has a _SEP_TOKEN_PRIVILEGES
+structure containing what privileges a token currently holds.  Our path
+towards elevation should be pretty obvious: by abusing a partial write and
+a userland information leak, we can flip a few bits in our process token
+and obtain access to administrative privileges.  Because we often cannot
+control the value being written, it's important that all possible values
+allow for elevation.  We've identified three bytes in which do not grant
+administrative privileges: 0x00, 0x40, 0x41.  That is, if you were to
+obtain a MOV BYTE PTR[controlled], 0x41 primitive, you would not be able to
+enable an exploitable privilege.  This assumes a MOV operation on default
+privilege bitmasks; other operations or combinations of privileges may
+grant elevated privileges.  All other values provide access to an
+exploitable privilege.
+ 
+In order to target this process token, we must be able to obtain the
+address of a controlled processes token.  As we're targeting privilege
+escalation vulnerabilities with this strategy, we can use and continue to
+use (as of v1703) the common NtQuerySystemInformation API to leak our
+process token address, as demonstrated below:
+ 
+  NtQuerySystemInformation(16, bHandleInfo, 
+                          sizeof(bHandleInfo),
+                          &BytesReturned));
+
+  PSYSTEM_HANDLE_INFORMATION shiHandleInfo = 
+                    (PSYSTEM_HANDLE_INFORMATION)bHandleInfo;
+  PSYSTEM_HANDLE_TABLE_ENTRY_INFO hteCurrent= &shiHandleInfo>Handles[0];
+
+  for (i = 0; i<shiHandleInfo>NumberOfHandles; hteCurrent++, i++) { 
+    if(hteCurrent>UniqueProcessId == dwPid && 
+            hteCurrent>HandleValue == (USHORT)hToken) 
+        return hteCurrent>Object; 
+  }
+ 
+The dwPid value is the process in which the token exists, and the hToken is
+a handle to the process token.  Note that, as of Windows 8.1 this strategy
+no longer works under Low integrity processes, and thus other methods will
+need to be employed.  For brevity and clarity, we will work under the
+assumption that we're targeting privilege escalation from a Medium
+integrity process (default IL for users) and rely on the above technique.
+ 
+----[ 3.3 - Abusing Existing Service Accounts
+ 
+In addition to being useful for local privilege escalation through
+arbitrary write primitives in the kernel, these same techniques can be of
+use in the more common scenario where an attacker is accessing the machine
+as a local service account.
+ 
+There are a number of common scenarios where an attacker is able to execute
+code in the context of a service account on a target machine, including the
+following:
+ 
+  + The service itself is compromised through some vulnerability. Typical
+    scenarios include web application vulnerabilities which allow execution
+    in the context of the account running IIS, and SQL injection 
+    vulnerabilities where XP_CMDSHELL can be used to run code in the 
+    context of the SQL service account.
+ 
+  + Service account credentials are leaked in some way.
+ 
+  + Kerberoast style attacks. A Kerberos ticket is requested for the target
+    account from the domain controller. Part of this ticket is encrypted
+    using the target account's password hash. This can be efficiently 
+    cracked offline to yield the account password.
+ 
+In any of these scenarios, if the service account happens to have one of
+the privileges outlined in the previous section, it is possible to gain
+local privilege escalation simply by leveraging the corresponding module
+from this project.
+ 
+----[ 3.3.1 - Common Service Accounts
+ 
+In this section, we will give brief examples of some common service
+accounts that can be abused for EoP due to their default token privileges.
+ 
+----[ 3.3.1.2 - MSSQL / IIS
+ 
+If we examine the default privileges assigned to the MSSQL and IIS service
+accounts using the “AccessChk” tool from Sysinternals, we find the
+following:
+ 
+  + IIS - SeImpersonatePrivilege - BUILTIN\IIS_IUSRS
+  + MSSQL - SeAssignPrimaryTokenPrivilege - 
+                            NT SERVICE\SQLAgent$SQLEXPRESS, 
+                            NT SERVICE\MSSQLLaunchpad$SQLEXPRESS, 
+                            NT SERVICE\MSSQL$SQLEXPRESS
+                                           
+These privileges are sufficient for EoP by leveraging the modules in this
+project. Compromise of these accounts is a very common penetration testing
+scenario. Any time SQL injection in MSSQL, or a web application
+vulnerability in IIS is exploited to gain command execution, the attackers
+end up with these privileges. Traditionally, this was considered a limiting
+scenario with a restricted local account and an attacker would need to
+resort to another method for EoP. Using the techniques outlined in this
+paper, it is simply a matter of abusing existing token privileges.
+ 
+----[ 3.3.1.3 - Backup Products
+ 
+Every commercial backup product on the market will run with some sort of
+elevated privilege. In many cases, the backup service account will run with
+SYSTEM privileges, making EoP unnecessary. Where administrators have
+started to smarten up however, we are starting to see the privileges on
+these accounts become more restricted. 
+ 
+The following are the minimum privileges required by the Veritas NetBackup
+solution, shamelessly borrowed from their website
+(https://www.veritas.com/support/en_US/article.TECH36718):
+ 
+  + *Act as a part of Operating System ( Only for Windows Server 2000 ).
+  + *Create a token object.
+  + Log on as a service.
+  + Logon as a batch job.
+  + Manage auditing and security log.  
+  + *Backup files and directories.
+  + *Restore files and directories.
+ 
+Note the 4 items in the list that we've marked with an asterisk (*). Any
+one of these privileges alone can be leveraged for EoP given one of the
+techniques described in this project.
+ 
+----[ 3.3.1.4 - Local Service Accounts 
+There are also pre-defined service accounts on every Windows machine that 
+contain privileges that can be leveraged for EoP. These are 
+“NT AUTHORITY\SERVICE”, “NT AUTHORITY\NETWORK SERVICE”, and 
+“NT AUTHORITY\LOCAL SERVICE”.
+ 
+Each of these has slightly different privileges, some contain multiple
+exploitable privileges, however they all have access to the exploitable
+SeImpersonatePrivilege.
+ 
+If an attacker is somehow able to gain access to the system under the
+context of one of these limited local accounts, they can trivially elevate
+their privileges to “NT AUTHORITY\SYSTEM” using the techniques outlined
+above.
+ 
+--[ 4 - Kernel Exploit Development Case Studies
+ 
+We'll now detail several case studies that demonstrate how and why we may
+want to delegate privileged exploitation to userland.  Note that our
+strategy applies towards elevation of privilege; it cannot, in its current
+state, be used remotely.
+ 
+----[ 4.1 - MS16-135
+ 
+MS16-135 is the bug that we first wrote an exploit for using this strategy,
+and proves to be a fantastic case study.  Initially released by Google
+after identifying active exploitation in the wild [13], a trigger was
+quickly released and the race for weaponization began.
+ 
+One of the first public demonstrations of exploitability was by Enrique
+Nissim at Zero Nights 2016 [14], in which he used the bug to demonstrate
+PML4 randomization weaknesses.  Several other proof of concepts followed in
+suit, most abusing the PML4 strategy, others using the pvscan0 technique.
+The bug can be triggered via SetWindowLongPtr with a specifically crafted
+window and index value.  The result is a controlled OR operation: OR DWORD
+PTR[controlled], 4.  The first step is identifying the address of
+_SEP_TOKEN_PRIVILEGES.  This can be accomplished using the following:
+ 
+  OpenProcessToken(OpenProcess(PROCESS_QUERY_INFORMATION, 
+                               1, GetParentProcessId()),
+                   TOKEN_QUERY | TOKEN_QUERY_SOURCE, 
+                   &current_token);
+
+  dwToken = (UINT)current_token & 0xffff; 
+  _TOKEN =  GetHandleAddress(GetCurrentProcessId(), dwToken);
+  startTokenOffset = (UINT)_TOKEN + 0x40;
+ 
+We first open a handle to our parent process token, then use a
+NtQuerySystemInformation wrapper function to fetch the actual address of
+the token.  The structure we're after lies 0x40 bytes ahead.  Note that the
+NtQuerySystemInformation leak only works from medium integrity processes on
+Windows 8.1+.  In order to exploit this from a low integrity process, we
+will need to abuse a different leak [9].
+ 
+With the token address, we now adjust the offset to the enabled bitmask and
+invoke:
+ 
+  ULONG enabled_create_token = startTokenOffset + 0xa;
+  SetWindowLongPtr(childWnd, GWLP_ID, (LONG)(enabled_create_token - 0x14));
+ 
+Should we trigger this bug multiple times while shifting the offset, we can
+hit each byte in the Enabled bitmask.  This enables the following
+privileges:
+ 
+  02 0x000000002 SeCreateTokenPrivilege            Attributes - Enabled 
+  10 0x00000000a SeLoadDriverPrivilege             Attributes - Enabled
+  18 0x000000012 SeRestorePrivilege                Attributes - Enabled
+  23 0x000000017 SeChangeNotifyPrivilege           Attributes - Enabled
+
+As we've seen, three of the four privileges enabled are trivially
+exploitable.  Our proof of concept code opts to abuse the
+SeRestorePrivilege, and can be found in the project git repository [3].
+ 
+Though many of the public exploits for this bug were written in such a way
+to demonstrate a technique, we find that the presented example highlights
+the simplicity and reliability of our strategy: it relies only on the
+external need to leak a token address from the kernel.  Public proof of
+concepts are much more complicated and require a variety of primitive
+grooming and kernel dancing.
+ 
+----[ 4.2 - MS15-061
+ 
+This was another fantastic bug observed in the wild during the RussianDoll
+campaigns and was quickly reversed and weaponized within the community.
+Much like MS16-135, this is a partial write that allows for the decrement
+of a controlled address.  The bug was a use after free in win32k,
+specifically yet another issue with usermode callbacks emanating from
+within win32k [15].
+ 
+Our strategy here does not differ much from the example in 4.1: we identify
+our token address, groom the heap to obtain our arbitrary decrement, and
+trigger it a few times to cover the Enabled and Present bitmasks.  This
+enables a whole host of different privileges, namely:
+ 
+  07 0x000000007 SeTcbPrivilege                    Attributes - Enabled
+  09 0x000000009 SeTakeOwnershipPrivilege          Attributes - Enabled 
+  10 0x00000000a SeLoadDriverPrivilege             Attributes - Enabled 
+  17 0x000000011 SeBackupPrivilege                 Attributes - Enabled
+  18 0x000000012 SeRestorePrivilege                Attributes - Enabled
+ 
+14 privileges are enabled, in total; the immediately exploitable ones are
+shown above.  A proof of concept is again provided in the project git
+repository [3].
+ 
+Public samples use a variety of strategies; one of the first released by
+NCC uses an older technique from Pwn2Own 2013, in which shellcode is
+stashed in a tagWND structure and the bServerSideWindowProc bit is
+decremented until it wraps, meaning that the tagWND's window procedure will
+be executed without context switching.  The shellcode used NULLs out
+winlogon's ACL and injects into the privileged process.  Other samples use
+the more modern process token swapping strategy.
+ 
+The point here being that we do not need to execute any shellcode and we
+do not need to work to obtain any other primitives. 
+ 
+----[ 4.3 - HEVD
+ 
+HEVD, or the HacksysExtremeVulnerableDriver [16], is an intentionally
+vulnerable Windows driver that can be loaded into a system to learn and
+research various exploitation strategies and techniques.  It additionally
+provides a simple way to demonstrate mitigation evasion strategies on
+modern, fully up-to-date systems without having to use 0days.
+ 
+We demonstrate our technique using the arbitrary write bug present in HEVD,
+triggerable with the 0x22200b control code.  As mentioned, the “bug” is an
+intentional and controllable write-what-where primitive in the driver, 
+distilled below for brevity:
+ 
+  NTSTATUS TriggerArbitraryOverwrite(IN PWRITE_WHAT_WHERE 
+                                                     UserWriteWhatWhere)
+  { 
+    What = UserWriteWhatWhere->What; 
+    Where = UserWriteWhatWhere->Where;
+    *(UserWriteWhatWhere->Where) = *(UserWriteWhatWhere->What);
+  }
+ 
+There are several public demonstrations on exploiting this; most for
+Windows 7, several for Windows 10 build 1607.  One from Cn33liz [17]
+demonstrates exploiting this via the GDI Reloaded technique presented at
+Ekoparty ‘16.  The Reloaded strategy improves upon the original GDI pvscan
+strategy, including bypassing the GDI shared handle table KASLR fix
+introduced in v1607, by leaking kernel addresses via the global gSharedInfo
+table (an old, but clearly still viable leak). 
+ 
+In v1703 (Creators Update), the table structure has been changed and the
+leaking addresses removed.  So, clearly the GDI Reloaded technique still
+works, provided we can identify another KASLR leak; something tells us one
+will turn up.
+ 
+The last sample of note is from GradiusX, which demonstrates exploitation
+on a v1703 Windows 10 system.  The sample uses the GDI rw primitive to leak
+the EPROCESS structure from the current process, which can then be used to
+leak the token address of the running process.  Once the address has been
+leaked, it leaks a SYSTEM token address and overwrites, using the GDI
+primitive, its resident token with the SYSTEM token.  Thus, the token swap.
+Using the GDI primitive to leak the EPROCESS structure (via _THREADINFO)
+allows it to bypass the need for a separate KASLR leak and should
+consequently work fine from low integrity processes.
+ 
+Our strategy here is pretty simple; there's no need to groom a heap,
+execute shellcode, or setup rw primitives.  Due to changes to the
+_SEP_TOKEN_PRIVILEGES structure [4], we must issue two separate calls to
+DeviceIoControl; one to overwrite the Enabled mask and one to the Present
+mask.  As with the previous examples, we fetch our token address and
+offsets:
+ 
+  uToken = (USHORT)current_token & 0xffff; 
+  _TOKEN = GetHandleAddress(GetCurrentProcessId(), uToken); 
+  startTokenOffset = (ULONG)_TOKEN + 0x40; 
+  enabled_offset = (ULONG)_TOKEN + 0x48;
+ 
+We then setup our what/where primitives (using the PWRITE_WHAT_WHERE
+structure as defined by HEVD):
+ 
+  pww = (PWRITE_WHAT_WHERE)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                    sizeof(WRITE_WHAT_WHERE)); 
+  pww->What = (PULONG_PTR)what; 
+  pww->Where = (PULONG_PTR)startTokenOffset;
+ 
+Then simply trigger the driver via DeviceIoControl.  We perform it a second
+time with the enabled_offset as the where.  We now have elevated privileges
+enabled on the token.
+ 
+--[ 5 - Conclusions
+ 
+As Microsoft continues to iterate and improve upon baseline mitigation
+strategies on Windows, both in userland and in the kernel, attackers
+additionally continue to iterate.  The ideas presented here may not be a
+breakthrough in offensive kernel exploitation, but we believe they provide
+a glimpse of where exploitation patterns are headed.  Towards the logical,
+away from the kernel, in the land where applications and scripts and Office
+documents frolic with critical, privileged controls.  We've demonstrated
+how trivial a write-whatever-where can be exploited in a safe, predictable,
+and stable way with only a haiku of information from the kernel.
+ 
+Attacking individual privileges seems to be a logical progression of
+existing trends: token swapping, DACL mangling, privileged file writes.
+Attackers more often than not are pursuing slices and not wholes; ability
+to read or write here, modify this or that file or key.  Limiting the scope
+of privileged access increases the overall effectiveness and decreases 
+exposure of an attack.  
+ 
+Ideally, we can identify other such privileges to be abused, as they are as
+bountiful as they are opaque.  The EPROCESS structure is ripe with flags
+and masks controlling various access gears within the kernel.  We did not
+touch offensively on impersonation, split access tokens, threads, or other
+such facilities, but their primitive potential is all but guaranteed.  The
+kernel boogeyman be damned.
+ 
+--[ 6 - Greetz
+
+Too many people.  Everything is iterative, nothing is original. 
+
+themson, bannedit, quitos, tiraniddo, aionescu, phrack, pastor laphroaig,
+shellster
+
+--[ 7 - References
+ 
+[0] https://blogs.technet.microsoft.com/mmpc/2017/01/13/hardening-windows-10-with-zero-day-exploit-mitigations/
+[1] https://media.blackhat.com/bh-us-12/Briefings/Cerrudo/BH_US_12_Cerrudo_Windows_Kernel_WP.pdf
+[2] https://blogs.technet.microsoft.com/mmpc/2016/11/01/our-commitment-to-our-customers-security/
+[3] https://github.com/hatRiot/token-priv
+[4] http://www.anti-reversing.com/2251/ 
+[5] https://labs.nettitude.com/blog/analysing-the-null-securitydescriptor-kernel-exploitation-mitigation-in-the-latest-windows-10-v1607-build-14393/
+[6] https://foxglovesecurity.com/2016/09/26/rotten-potato-privilege-escalation-from-service-accounts-to-system/
+[7] https://bugs.chromium.org/p/project-zero/issues/detail?id=872 
+[8] https://www.blackhat.com/docs/us-16/materials/us-16-Weston-Windows-10-Mitigation-Improvements.pdf
+[9] https://github.com/sam-b/windows_kernel_address_leaks 
+[10] https://media.blackhat.com/bh-us-12/Briefings/Cerrudo/BH_US_12_Cerrudo_Windows_Kernel_WP.pdf
+[11] https://www.blackhat.com/docs/eu-16/materials/eu-16-Liang-Attacking-Windows-By-Windows.pdf
+[12] https://labs.bluefrostsecurity.de/publications/2016/01/07/exploiting-cve-2014-4113-on-windows-8.1/
+[13] https://security.googleblog.com/2016/10/disclosing-vulnerabilities-to-protect.html
+[14] https://github.com/IOActive/I-know-where-your-page-lives/
+[15] https://community.rapid7.com/community/metasploit/blog/2015/10/01/flipping-bits
+[16] https://github.com/hacksysteam/HackSysExtremeVulnerableDriver
+[17] https://github.com/Cn33liz/HSEVD-ArbitraryOverwriteGDI 
+[18] http://uninformed.org/index.cgi?v=8&a=5&p=2
+[19] https://blogs.msdn.microsoft.com/winsdk/2015/08/28/logon-as-a-user-without-a-password/
+[20] https://bugs.chromium.org/p/project-zero/issues/detail?id=325
