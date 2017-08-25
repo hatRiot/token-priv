@@ -269,7 +269,7 @@ detailed to provide background and to pay homage to those who came before
 us.
  
 Cesar Cerrudos Easy Local Windows Kernel Exploitation paper released at
-Blackhat 2012 [11] introduced three different privilege escalation
+Blackhat 2012 [1] introduced three different privilege escalation
 strategies, and pointed many exploit devs towards the power of abusing
 process tokens.  The first technique demonstrated in the paper details the
 NULL ACL strategy, now partially mitigated, in which an arbitrary
